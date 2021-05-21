@@ -16,6 +16,7 @@ from smoke.modeling.heatmap_coder import (
 )
 from smoke.modeling.smoke_coder import encode_label
 from smoke.structures.params_3d import ParamsList
+from smoke.data.datasets.data_augmentation import DataAugmentation
 
 TYPE_ID_CONVERSION = {
     'Car': 0,
@@ -60,8 +61,11 @@ class KITTIDataset(Dataset):
 
         self.flip_prob = cfg.INPUT.FLIP_PROB_TRAIN if is_train else 0
         self.aug_prob = cfg.INPUT.SHIFT_SCALE_PROB_TRAIN if is_train else 0
+        self.gaussian_prob = cfg.INPUT.GAUSSIAN_NOISE_PROB_TRAIN if is_train else 0
+        self.color_prob = cfg.INPUT.COLOR_CHANGE_PROB_TRAIN if is_train else 0
         self.shift_scale = cfg.INPUT.SHIFT_SCALE_TRAIN
         self.right_prob = cfg.INPUT.USE_RIGHT_PROB_TRAIN if is_train else 0
+        self.mosaic_prob = cfg.INPUT.MOSAIC_PROB_TRAIN if is_train else 0
 
         self.num_classes = len(self.classes)
 
@@ -82,6 +86,8 @@ class KITTIDataset(Dataset):
         original_idx = self.label_files[idx].replace(".txt", "")
         
         anns, P2, P3 = self.load_annotations(idx)
+        anns_list = [anns]
+
         use_left = True
         if (self.is_train) and (random.random() < self.right_prob):
             use_left = False
@@ -93,10 +99,11 @@ class KITTIDataset(Dataset):
             P = P2
             img_path = os.path.join(self.image_dir, self.image_files[idx])
         
-        
         img = Image.open(img_path)
         center = np.array([i / 2 for i in img.size], dtype=np.float32)
         size = np.array([i for i in img.size], dtype=np.float32)
+        region_list = [[0, self.output_width, 0, self.output_height]]
+        P_list = [P]
 
         """
         resize, horizontal flip, and affine augmentation are performed here.
@@ -120,6 +127,33 @@ class KITTIDataset(Dataset):
             scale_ranges = np.arange(1 - scale, 1 + scale + 0.1, 0.1)
             size *= random.choice(scale_ranges)
 
+        if (self.is_train) and (0 < self.mosaic_prob) and not affine and not flipped:
+            mosaic_idx = random.choice(range(self.num_samples))
+            mosaic_anns, mosaic_P2, mosaic_P3 = self.load_annotations(mosaic_idx)
+            if use_left:
+                mosaic_P = mosaic_P2
+                mosaic_img_path = os.path.join(self.image_dir, self.image_files[mosaic_idx])
+            else:
+                mosaic_P = mosaic_P3
+                mosaic_img_path = os.path.join(self.image3_dir, self.image_files[mosaic_idx])
+
+            mosaic_img = Image.open(mosaic_img_path)
+            if mosaic_img.size == img.size:
+                anns_list.append(mosaic_anns)
+                P_list.append(mosaic_P)
+
+                left_ratio = random.uniform(0.3, 0.7)
+                region = [0, left_ratio * self.output_width, 0, self.output_height]
+                mosaic_region = [left_ratio * self.output_width, self.output_width, 0, self.output_height]
+                region_list = [region, mosaic_region]
+                mosaic_img = mosaic_img.crop((int(left_ratio*img.size[0]), 0, mosaic_img.size[0], mosaic_img.size[1]))
+                img.paste(mosaic_img, (int(left_ratio*img.size[0]), 0, img.size[0], img.size[1]))
+
+        if (self.is_train) and (random.random() < self.gaussian_prob):
+            img = DataAugmentation.randomGaussian(img)
+        if (self.is_train) and (random.random() < self.color_prob):
+            img = DataAugmentation.randomColor(img)
+
         center_size = [center, size]
         trans_affine = get_transfrom_matrix(
             center_size,
@@ -132,11 +166,11 @@ class KITTIDataset(Dataset):
             data=trans_affine_inv.flatten()[:6],
             resample=Image.BILINEAR,
         )
-        '''
+        
         image = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
         shape = (int(image.shape[1] / 4), int(image.shape[0] / 4))
         image = cv2.resize(image, shape, interpolation = cv2.INTER_AREA)
-        '''
+
         trans_mat = get_transfrom_matrix(
             center_size,
             [self.output_width, self.output_height]
@@ -170,54 +204,57 @@ class KITTIDataset(Dataset):
         p_2d_offsets = np.zeros([self.max_objs, 2], dtype=np.float32)
         p_2d_whs = np.zeros([self.max_objs, 2], dtype=np.float32)
 
-        for i, a in enumerate(anns):
-            a = a.copy()
-            cls = a["label"]
+        for i in range(len(anns_list)):
+            anns = anns_list[i]
+            region = region_list[i]
+            P = P_list[i]
+            for i, a in enumerate(anns):
+                a = a.copy()
+                cls = a["label"]
 
-            locs = np.array(a["locations"])
-            rot_y = np.array(a["rot_y"])
-            if flipped:
-                locs[0] *= -1
-                rot_y *= -1
+                locs = np.array(a["locations"])
+                rot_y = np.array(a["rot_y"])
+                if flipped:
+                    locs[0] *= -1
+                    rot_y *= -1
 
-            point, box2d, box3d = encode_label(
-                P, rot_y, a["dimensions"], locs
-            )
-            point = affine_transform(point, trans_mat)
-            box2d[:2] = affine_transform(box2d[:2], trans_mat)
-            box2d[2:] = affine_transform(box2d[2:], trans_mat)
-            box2d[[0, 2]] = box2d[[0, 2]].clip(0, self.output_width - 1)
-            box2d[[1, 3]] = box2d[[1, 3]].clip(0, self.output_height - 1)
-            h, w = box2d[3] - box2d[1], box2d[2] - box2d[0]
-            center_2d = np.array([box2d[0] + box2d[2], box2d[1] + box2d[3]]) * 0.5 
-            
-            '''
-            cv2.circle(image, (int(point[0]), int(point[1])), 3, (255,0,0),-1)
-            '''
-            if (0 < point[0] < self.output_width) and (0 < point[1] < self.output_height) and int(a['occlusion']) != 2:
-                point_int = point.astype(np.int32)
-                p_offset = point - point_int
-                radius = gaussian_radius(h, w)
-                radius = max(0, int(radius))
-                heat_map[cls] = draw_umich_gaussian(heat_map[cls], point_int, radius)
+                point, box2d, box3d = encode_label(
+                    P, rot_y, a["dimensions"], locs
+                )
+                point = affine_transform(point, trans_mat)
+                box2d[:2] = affine_transform(box2d[:2], trans_mat)
+                box2d[2:] = affine_transform(box2d[2:], trans_mat)
+                box2d[[0, 2]] = box2d[[0, 2]].clip(0, self.output_width - 1)
+                box2d[[1, 3]] = box2d[[1, 3]].clip(0, self.output_height - 1)
+                h, w = box2d[3] - box2d[1], box2d[2] - box2d[0]
+                center_2d = np.array([box2d[0] + box2d[2], box2d[1] + box2d[3]]) * 0.5 
+                
+                if (region[0] < point[0] < region[1]) and (region[2] < point[1] < region[3]):
+                    cv2.circle(image, (int(point[0]), int(point[1])), 3, (255,0,0),-1)
+                    
+                    point_int = point.astype(np.int32)
+                    p_offset = point - point_int
+                    radius = gaussian_radius(h, w)
+                    radius = max(0, int(radius))
+                    heat_map[cls] = draw_umich_gaussian(heat_map[cls], point_int, radius)
 
-                cls_ids[i] = cls
-                regression[i] = box3d
-                proj_points[i] = point_int
-                p_offsets[i] = p_offset
-                dimensions[i] = np.array(a["dimensions"])
-                locations[i] = locs
-                rotys[i] = rot_y
-                reg_mask[i] = 1 if not affine else 0
-                flip_mask[i] = 1 if not affine and flipped else 0
+                    cls_ids[i] = cls
+                    regression[i] = box3d
+                    proj_points[i] = point_int
+                    p_offsets[i] = p_offset
+                    dimensions[i] = np.array(a["dimensions"])
+                    locations[i] = locs
+                    rotys[i] = rot_y
+                    reg_mask[i] = 1 if not affine else 0
+                    flip_mask[i] = 1 if not affine and flipped else 0
 
-                regression_2d[i] = box2d
-                p_2d_offsets[i] = center_2d - point_int
-                p_2d_whs[i] = np.array([w, h])
+                    regression_2d[i] = box2d
+                    p_2d_offsets[i] = center_2d - point_int
+                    p_2d_whs[i] = np.array([w, h])
 
-        '''
+        
         cv2.imwrite(os.path.join("/root/SMOKE/debug", original_idx + ".jpg"), image)
-        '''
+
         P = np.concatenate((P, np.ones((1, 4), dtype=np.float32)), axis=0)
         P[3, :3] = 0
         target = ParamsList(image_size=img.size,

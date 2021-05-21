@@ -36,6 +36,10 @@ _C.INPUT.FLIP_PROB_TRAIN = 0.5
 # Shift and scale probability
 _C.INPUT.SHIFT_SCALE_PROB_TRAIN = 0.3
 _C.INPUT.USE_RIGHT_PROB_TRAIN = 0.3
+_C.INPUT.MOSAIC_PROB_TRAIN = 0.5
+_C.INPUT.GAUSSIAN_NOISE_PROB_TRAIN = 0.3
+_C.INPUT.COLOR_CHANGE_PROB_TRAIN = 0.3
+
 _C.INPUT.SHIFT_SCALE_TRAIN = (0.2, 0.4)
 
 # -----------------------------------------------------------------------------
