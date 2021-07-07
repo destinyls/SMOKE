@@ -95,6 +95,12 @@ class KITTIDataset(Dataset):
         
         
         img = Image.open(img_path)
+        '''
+        image = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+        gamma = random.uniform(0.5, 1.5)
+        image = self.gamma_trans(image, 2.0)
+        img = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        '''
         center = np.array([i / 2 for i in img.size], dtype=np.float32)
         size = np.array([i for i in img.size], dtype=np.float32)
 
@@ -229,6 +235,11 @@ class KITTIDataset(Dataset):
             img, target = self.transforms(img, target)
 
         return img, target, original_idx
+
+    def gamma_trans(self, img, gamma):
+        gamma_table = [np.power(x/255.0, gamma)*255.0 for x in range(256)]
+        gamma_table = np.round(np.array(gamma_table)).astype(np.uint8)
+        return cv2.LUT(img, gamma_table)
 
     def load_annotations(self, idx):
         annotations = []

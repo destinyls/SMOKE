@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torchvision.ops import RoIAlign, RoIPool
 
 from smoke.utils.registry import Registry
 from smoke.modeling import registry
@@ -37,6 +38,8 @@ class SMOKEPredictor(nn.Module):
         regression_channels = cfg.MODEL.SMOKE_HEAD.REGRESSION_CHANNEL
         head_conv = cfg.MODEL.SMOKE_HEAD.NUM_CHANNEL
         norm_func = _HEAD_NORM_SPECS[cfg.MODEL.SMOKE_HEAD.USE_NORMALIZATION]
+
+        self.roi_align = RoIAlign(output_size=[1,1], spatial_scale=1, sampling_ratio=2)
 
         assert sum(regression_channels) == regression, \
             "the sum of {} must be equal to regression channel of {}".format(
@@ -105,20 +108,37 @@ class SMOKEPredictor(nn.Module):
             )
             proj_points = torch.cat([xs.view(-1, 1), ys.view(-1, 1)], dim=1).unsqueeze(0)
 
-        proj_points_8 = proj_points // 2
-        proj_points_16 = proj_points // 4
+        proj_points = proj_points.float()
+        proj_points_8 = proj_points / 2
+        proj_points_16 = proj_points / 4
+        
+        batch_id = torch.arange(batch, dtype=torch.float, device=proj_points.device).unsqueeze(1)
+        roi_id = batch_id.repeat(1, proj_points.shape[1]).view(-1, 1)
 
-        # 1/4 [N, K, 256]
-        regression_pois = select_point_of_interest(batch, proj_points, head_regression)
-        # 1/8 [N, K, 128]
-        up_level8_pois = select_point_of_interest(batch, proj_points_8, up_level8)
-        # 1/16 [N, K, 256]
-        up_level16_pois = select_point_of_interest(batch, proj_points_16, up_level16)
-        # [N, K, 640]
-        regression_pois = torch.cat((regression_pois, up_level8_pois, up_level16_pois), dim=-1)
+        # RoIs
+        proj_rois = torch.cat([proj_points - 2, proj_points + 2], dim=-1)
+        proj_rois = proj_rois.view(-1, proj_rois.shape[-1])
+        proj_rois = torch.cat([roi_id, proj_rois], dim=-1)
+        
+        proj_rois_8 = torch.cat([proj_points_8 - 1, proj_points_8 + 1], dim=-1)
+        proj_rois_8 = proj_rois_8.view(-1, proj_rois_8.shape[-1])
+        proj_rois_8 = torch.cat([roi_id, proj_rois_8], dim=-1)
 
-        # [N, 640, K, 1]
+        proj_rois_16 = torch.cat([proj_points_16 - 0.5, proj_points_16 + 0.5], dim=-1)
+        proj_rois_16 = proj_rois_16.view(-1, proj_rois_16.shape[-1])
+        proj_rois_16 = torch.cat([roi_id, proj_rois_16], dim=-1)
+        
+        regression_pois = self.roi_align(head_regression, proj_rois)
+        up_level8_pois = self.roi_align(up_level8, proj_rois_8)
+        up_level16_pois = self.roi_align(up_level16, proj_rois_16)
+
+        regression_pois = regression_pois.view(batch, -1, 256 )
+        up_level8_pois = up_level8_pois.view(batch, -1, 128)
+        up_level16_pois = up_level16_pois.view(batch, -1, 256)
+
+        regression_pois = torch.cat([regression_pois, up_level8_pois, up_level16_pois], dim=-1)
         regression_pois = regression_pois.permute(0, 2, 1).contiguous().unsqueeze(-1)
+
         # [N, 8, K, 1]
         head_regression = self.reg_3dbox(regression_pois)
 
